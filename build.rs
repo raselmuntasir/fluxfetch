@@ -102,29 +102,35 @@ VALUE "Translation", 0x0, 0x04b0
     );
     std::fs::write(scratch.join("main.rc"), rc).map_err(|e| format!("writing the .rc: {e}"))?;
 
-    let windres = find_windres()?;
-    let output = Command::new(&windres)
-        .current_dir(&scratch)
-        .args(["main.rc", "-o", "main.o"])
+    let compiler = find_resource_compiler()?;
+    let is_windows_rc = compiler.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.eq_ignore_ascii_case("rc.exe"));
+    let object = if is_windows_rc { scratch.join("main.res") } else { scratch.join("main.o") };
+    let mut command = Command::new(&compiler);
+    command.current_dir(&scratch);
+    if is_windows_rc {
+        command.args(["/nologo", "/fo", "main.res", "main.rc"]);
+    } else {
+        command.args(["main.rc", "-o", "main.o"]);
+    }
+    let output = command
         .output()
-        .map_err(|e| format!("running {}: {e}", windres.display()))?;
+        .map_err(|e| format!("running {}: {e}", compiler.display()))?;
     if !output.status.success() {
         return Err(format!(
             "{} failed: {}",
-            windres.display(),
+            compiler.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let object = scratch.join("main.o");
     if !object.is_file() {
-        return Err("windres produced no object file".into());
+        return Err("resource compiler produced no output file".into());
     }
     println!("cargo:rustc-link-arg-bins={}", object.display());
     Ok(())
 }
 
 /// `windres` from the environment, then `PATH`, then a rustup GNU toolchain.
-fn find_windres() -> Result<PathBuf, String> {
+fn find_resource_compiler() -> Result<PathBuf, String> {
     if let Ok(explicit) = std::env::var("WINDRES") {
         let path = Path::new(&explicit);
         if path.is_file() {
@@ -150,7 +156,18 @@ fn find_windres() -> Result<PathBuf, String> {
             }
         }
     }
-    Err("windres.exe not found (set the WINDRES env var)".into())
+    let kits = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
+    if let Ok(entries) = std::fs::read_dir(kits) {
+        let mut versions: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+        versions.sort();
+        for version in versions.into_iter().rev() {
+            let candidate = version.join("x64").join("rc.exe");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err("neither windres.exe nor Windows SDK rc.exe was found".into())
 }
 
 /// Copy MinGW's static libstdc++ and winpthread archives into a folder of
